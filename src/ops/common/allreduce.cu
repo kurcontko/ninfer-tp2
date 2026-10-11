@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -257,6 +258,116 @@ void detail::require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer
 #endif
 }
 
+namespace {
+
+// The exchange lanes of PipelinedExchange: one extra stream per rank, created on first use and kept
+// for the process (the engine has one device pair), with the events that order the lanes against
+// each other and against the rank streams.
+struct ExchangeLanes {
+    std::array<int, 2> device{-1, -1};
+    std::array<cudaStream_t, 2> stream{nullptr, nullptr};
+    std::array<cudaEvent_t, 2> pulled{nullptr, nullptr};
+    std::array<std::vector<cudaEvent_t>, 2> done;
+
+    cudaEvent_t done_event(int rank, int index) {
+        auto& pool = done[static_cast<std::size_t>(rank)];
+        while (pool.size() <= static_cast<std::size_t>(index)) {
+            cudaEvent_t event = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            pool.push_back(event);
+        }
+        return pool[static_cast<std::size_t>(index)];
+    }
+};
+
+ExchangeLanes& exchange_lanes(const ExecutionContext& ec) {
+    static ExchangeLanes lanes;
+    if (lanes.stream[0] == nullptr) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec.dev[r]->device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&lanes.stream[r], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lanes.pulled[r], cudaEventDisableTiming));
+            lanes.device[r] = ec.dev[r]->device;
+        }
+    }
+    require(lanes.device[0] == ec.dev[0]->device && lanes.device[1] == ec.dev[1]->device,
+            "PipelinedExchange: one device pair per process");
+    return lanes;
+}
+
+} // namespace
+
+PipelinedExchange::PipelinedExchange(const ExecutionContext& ec, const PeerEvents& events)
+    : ec_(&ec), events_(&events) {
+    require_two_devices(ec, "PipelinedExchange: requires two distinct devices");
+    require(events.live(), "PipelinedExchange: events must be live");
+    require(events.pipeline_ == nullptr, "PipelinedExchange: a scope is already open");
+    const CurrentDeviceGuard guard;
+    (void)exchange_lanes(ec);
+    events.pipeline_ = this;
+}
+
+PipelinedExchange::~PipelinedExchange() {
+    events_->pipeline_ = nullptr;
+    if (issued_ == 0) { return; }
+    try {
+        join();
+    } catch (...) {
+        // The rank streams are left unordered against the lanes only if CUDA itself failed, and
+        // the next call on either stream reports that.
+    }
+}
+
+void PipelinedExchange::wait(int index) const {
+    require(index >= 0 && index < issued_, "PipelinedExchange: no such exchange");
+    const CurrentDeviceGuard guard;
+    ExchangeLanes& lanes = exchange_lanes(*ec_);
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec_->dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaStreamWaitEvent(local.stream, lanes.done_event(rank, index), 0));
+    }
+}
+
+void PipelinedExchange::join() const {
+    // The lanes run exchanges in issue order, so the last one orders them all.
+    if (issued_ > 0) { wait(issued_ - 1); }
+}
+
+void PipelinedExchange::enqueue(const std::array<Tensor, 2>& buffer,
+                                const std::array<Tensor, 2>& staging) {
+    const std::size_t bytes = buffer[0].bytes();
+    const CurrentDeviceGuard guard;
+    ExchangeLanes& lanes = exchange_lanes(*ec_);
+    const int index      = issued_;
+
+    // The three phases of the staged path, with B and C on the lanes. A lane additionally waits
+    // for its own rank's operand, which the rank stream is still producing.
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec_->dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaEventRecord(events_->inputs_ready(rank), local.stream));
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec_->dev[r]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], events_->inputs_ready(1 - rank), 0));
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], events_->inputs_ready(rank), 0));
+        CUDA_CHECK(pull_peer(staging[r].data, buffer[1 - r].data, bytes, lanes.stream[r]));
+        CUDA_CHECK(cudaEventRecord(lanes.pulled[r], lanes.stream[r]));
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec_->dev[r]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], lanes.pulled[1 - r], 0));
+        Tensor accumulator = buffer[r];
+        detail::residual_add_launch(staging[r], accumulator, lanes.stream[r]);
+        CUDA_CHECK(cudaEventRecord(lanes.done_event(rank, index), lanes.stream[r]));
+    }
+    ++issued_;
+}
+
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
     detail::require_allreduce_sum_arguments(buffer, staging, ec, events);
@@ -275,6 +386,11 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
             CurrentDeviceGuard::set(local.device);
             mailbox->enqueue_exchange_sum(rank, slot, buffer[rank].data, bytes, local.stream);
         }
+        return;
+    }
+
+    if (PipelinedExchange* pipeline = events.pipeline()) {
+        pipeline->enqueue(buffer, staging);
         return;
     }
 

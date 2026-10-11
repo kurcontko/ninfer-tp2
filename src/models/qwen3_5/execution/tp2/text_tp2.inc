@@ -300,6 +300,41 @@ const GdnReplayRecords& TextContext::rank_replay_records(int rank) const {
     return *records;
 }
 
+namespace {
+
+// Tokens per exchange slice of the pipelined prefill (NINFER_TP_PREFILL_SLICE, a positive count;
+// unset or 0: off). A prefill chunk of at least two slices issues each layer's two output
+// projections and its FFN slice by slice with the all-reduces on the exchange lanes
+// (ops::PipelinedExchange), so a slice's host-bounced exchange overlaps the next slice's compute.
+std::int32_t prefill_exchange_slice_tokens() {
+    static const std::int32_t tokens = [] {
+        const char* value = std::getenv("NINFER_TP_PREFILL_SLICE");
+        if (value == nullptr || *value == '\0') { return std::int32_t{0}; }
+        char* end         = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (*end != '\0' || parsed < 0 || parsed > (1 << 20)) {
+            throw std::invalid_argument("NINFER_TP_PREFILL_SLICE must be a token count");
+        }
+        return static_cast<std::int32_t>(parsed);
+    }();
+    return tokens;
+}
+
+template <class Body>
+void for_each_exchange_slice(std::int32_t columns, Body&& body) {
+    const std::int32_t slice = prefill_exchange_slice_tokens();
+    for (std::int32_t first = 0; first < columns; first += slice) {
+        body(first, std::min(slice, columns - first));
+    }
+}
+
+std::array<Tensor, kTensorParallelWidth> column_slice(const std::array<Tensor, kTensorParallelWidth>& t,
+                                                      std::int32_t first, std::int32_t count) {
+    return {t[0].slice(1, first, count), t[1].slice(1, first, count)};
+}
+
+} // namespace
+
 void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
                                const RankTensors& staging) {
     const ExecutionContext& execution = *tp_->execution;
@@ -386,8 +421,17 @@ void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
         ops::sigmoid_mul(gate, a[r], s);
     });
 
-    attention_output_split({a[0].view({q_width, T}), a[1].view({q_width, T})}, p, x, staging, ws,
-                           execution, *tp_->events);
+    const RankTensors mixed{a[0].view({q_width, T}), a[1].view({q_width, T})};
+    if (tp_->events->pipeline() != nullptr) {
+        for_each_exchange_slice(T, [&](std::int32_t first, std::int32_t count) {
+            attention_output_split(column_slice(mixed, first, count), p,
+                                   column_slice(x, first, count),
+                                   column_slice(staging, first, count), ws, execution,
+                                   *tp_->events);
+        });
+        return;
+    }
+    attention_output_split(mixed, p, x, staging, ws, execution, *tp_->events);
 }
 
 void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Phase ph,
@@ -554,8 +598,15 @@ void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Pha
         ops::gated_rmsnorm(o[r], p[r]->norm, gate, config_.rms_norm_eps, on[r], rank_stream(rank));
     });
 
-    gdn_output_split({on[0].view({value_width, T}), on[1].view({value_width, T})}, p, x, staging,
-                     ws, execution, *tp_->events);
+    const RankTensors mixed{on[0].view({value_width, T}), on[1].view({value_width, T})};
+    if (tp_->events->pipeline() != nullptr) {
+        for_each_exchange_slice(T, [&](std::int32_t first, std::int32_t count) {
+            gdn_output_split(column_slice(mixed, first, count), p, column_slice(x, first, count),
+                             column_slice(staging, first, count), ws, execution, *tp_->events);
+        });
+        return;
+    }
+    gdn_output_split(mixed, p, x, staging, ws, execution, *tp_->events);
 }
 
 void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTensors& staging) {
@@ -564,6 +615,24 @@ void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTe
     RankTensors h;
     for (std::size_t r = 0; r < 2; ++r) {
         h[r] = workspace::post_mixer_hidden(*ws[r], config_, x[r].ne[1]);
+    }
+    if (ops::PipelinedExchange* pipeline = tp_->events->pipeline()) {
+        // Slice s of the mixer's sum is exchange s of the layer's scope. Its FFN starts as soon
+        // as that exchange lands, while the later slices' are still in flight.
+        int mixer_exchange = 0;
+        for_each_exchange_slice(x[0].ne[1], [&](std::int32_t first, std::int32_t count) {
+            pipeline->wait(mixer_exchange++);
+            const RankTensors xs = column_slice(x, first, count);
+            RankTensors hs       = column_slice(h, first, count);
+            for_each_rank(execution, [&](int rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                ops::rmsnorm(xs[r], w[r]->post_attention_norm, config_.rms_norm_eps, true, hs[r],
+                             rank_stream(rank));
+            });
+            ffn_split(hs, {&w[0]->ffn, &w[1]->ffn}, xs, column_slice(staging, first, count), ws,
+                      execution, *tp_->events);
+        });
+        return;
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -578,6 +647,8 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
     const bool prefill  = ph == Phase::Prefill;
     const auto& layers0 = parameters_.text.layers;
     const auto& layers1 = tp_->parameters->text.layers;
+    const std::int32_t slice = prefill ? prefill_exchange_slice_tokens() : 0;
+    const bool pipelined     = slice > 0 && x[0].ne[1] >= 2 * slice;
     for (std::size_t layer = 0; layer < layers0.size(); ++layer) {
         const RankBlocks block{&layers0[layer], &layers1[layer]};
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -587,6 +658,10 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
             full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
         try {
+            // Declared before the layer's kernels are issued and joined after them: the layer
+            // output is the sum only once its last FFN exchange has landed.
+            std::optional<ops::PipelinedExchange> exchange;
+            if (pipelined) { exchange.emplace(*tp_->execution, *tp_->events); }
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -608,6 +683,7 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                 auto scope1 = tp_->work->scope();
                 mlp_tail_tp2(block, x, staging);
             }
+            if (exchange) { exchange->join(); }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x[0], ctx_.stream);
                 peer_tap_capture_layer(static_cast<int>(layer), x[1]);

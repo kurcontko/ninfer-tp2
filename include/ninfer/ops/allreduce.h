@@ -119,6 +119,8 @@ bool enable_peer_access(const ExecutionContext& ec);
 // An instance also names the stream pair's captured transport: null (the staged path for every
 // call) until attach_mailbox() installs a PeerMailbox, which the caller keeps alive for as long as
 // this instance is used and every graph captured through it exists.
+class PipelinedExchange;
+
 class PeerEvents {
 public:
     explicit PeerEvents(const ExecutionContext& ec);
@@ -172,11 +174,60 @@ public:
 
     [[nodiscard]] bool staged_only() const noexcept { return staged_scopes_ != 0; }
 
+    // The open PipelinedExchange scope of this pair (null: none). While one is open, eager
+    // allreduce_sum() calls are issued on its exchange lanes instead of the ranks' own streams.
+    [[nodiscard]] PipelinedExchange* pipeline() const noexcept { return pipeline_; }
+
 private:
+    friend class PipelinedExchange;
+    mutable PipelinedExchange* pipeline_ = nullptr;
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
     PeerMailbox* mailbox_           = nullptr;
     mutable int staged_scopes_      = 0;
+};
+
+/**
+ * Scope that moves this pair's eager staged all-reduces off the ranks' own streams.
+ *
+ * Without peer access a staged all-reduce is a host-bounced copy in each direction, and at prefill
+ * sizes (BF16 [hidden, tokens]) that copy is as long as the compute it separates. Issued on the
+ * rank's stream it also blocks that stream. While a scope is open, allreduce_sum() instead issues
+ * the pull and the local combine on one exchange lane per rank (a second stream on the same
+ * device) and returns at once, so the caller's next kernels on the rank streams run while the
+ * payload is in flight. Exchanges run in issue order on the lanes. The arithmetic and the bytes
+ * moved are those of the staged path.
+ *
+ * The caller owns the ordering against its own later work: `buffer[r]` holds the sum only after
+ * exchange `index` completed, so before reading (or overwriting) it on the rank streams it calls
+ * wait(index), or join() for every exchange issued so far. `staging[r]` belongs to the lanes until
+ * then. The destructor joins. One scope per PeerEvents at a time; not usable under stream capture.
+ * Issued from the single engine thread, like every other collective.
+ */
+class PipelinedExchange {
+public:
+    PipelinedExchange(const ExecutionContext& ec, const PeerEvents& events);
+    ~PipelinedExchange();
+
+    PipelinedExchange(const PipelinedExchange&)            = delete;
+    PipelinedExchange& operator=(const PipelinedExchange&) = delete;
+
+    // Number of all-reduces issued in this scope; the next one gets this index.
+    [[nodiscard]] int issued() const noexcept { return issued_; }
+
+    // Orders both rank streams after exchange `index`.
+    void wait(int index) const;
+
+    // Orders both rank streams after every exchange issued so far.
+    void join() const;
+
+    // allreduce_sum()'s body while the scope is open.
+    void enqueue(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging);
+
+private:
+    const ExecutionContext* ec_;
+    const PeerEvents* events_;
+    int issued_ = 0;
 };
 
 /**

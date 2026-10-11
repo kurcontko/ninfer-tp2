@@ -40,6 +40,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <optional>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
