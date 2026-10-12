@@ -27,13 +27,18 @@
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/mman.h>
 
 namespace ninfer::ops {
 namespace {
@@ -260,23 +265,77 @@ void detail::require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer
 
 namespace {
 
-// The exchange lanes of PipelinedExchange: one extra stream per rank, created on first use and kept
+// The exchange lanes of PipelinedExchange: extra streams per rank, created on first use and kept
 // for the process (the engine has one device pair), with the events that order the lanes against
 // each other and against the rank streams.
+//
+// HOST BOUNCE (default; NINFER_TP_PREFILL_BOUNCE=0 restores the DeviceToDevice pull): without peer
+// access the driver bounces a DeviceToDevice copy through host memory it owns. Here the bounce is
+// explicit: `out` copies the rank's partial into a host arena in blocks, and `stream` copies the
+// peer's blocks in as each one lands. The arena is transparent-huge-page backed, which matters
+// under an IOMMU in translated mode: measured on 2x RTX 5070 Ti (PCIe 5.0 x8 each, VT-d DMA-FQ),
+// a 40 MiB exchange takes 2.9 ms this way against 4.1 ms for the driver's bounce.
 struct ExchangeLanes {
     std::array<int, 2> device{-1, -1};
     std::array<cudaStream_t, 2> stream{nullptr, nullptr};
+    std::array<cudaStream_t, 2> out{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pulled{nullptr, nullptr};
     std::array<std::vector<cudaEvent_t>, 2> done;
+    std::array<std::vector<cudaEvent_t>, 2> sent;
+    std::array<char*, 2> arena{nullptr, nullptr};
+    std::size_t arena_bytes = 0;
+    std::size_t arena_used  = 0;
+    std::size_t block       = std::size_t{2} << 20;
+    int previous_issued     = 0;
+    bool bounce             = true;
 
-    cudaEvent_t done_event(int rank, int index) {
-        auto& pool = done[static_cast<std::size_t>(rank)];
-        while (pool.size() <= static_cast<std::size_t>(index)) {
+    static cudaEvent_t event_at(std::vector<cudaEvent_t>& pool, std::size_t index) {
+        while (pool.size() <= index) {
             cudaEvent_t event = nullptr;
             CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             pool.push_back(event);
         }
-        return pool[static_cast<std::size_t>(index)];
+        return pool[index];
+    }
+
+    cudaEvent_t done_event(int rank, int index) {
+        return event_at(done[static_cast<std::size_t>(rank)], static_cast<std::size_t>(index));
+    }
+
+    cudaEvent_t sent_event(int rank, std::size_t block_index) {
+        return event_at(sent[static_cast<std::size_t>(rank)], block_index);
+    }
+
+    // Returns the arena offset of `bytes` of bounce storage per rank, valid until the scope that
+    // issued it is over. Growing drains the lanes first: nothing is in flight in the old arena.
+    std::size_t reserve(std::size_t bytes) {
+        if (arena_used + bytes > arena_bytes) {
+            constexpr std::size_t huge = std::size_t{2} << 20;
+            const std::size_t wanted =
+                (std::max(2 * (arena_used + bytes), std::size_t{64} << 20) + huge - 1) / huge * huge;
+            for (std::size_t r = 0; r < 2; ++r) {
+                CurrentDeviceGuard::set(device[r]);
+                CUDA_CHECK(cudaStreamSynchronize(out[r]));
+                CUDA_CHECK(cudaStreamSynchronize(stream[r]));
+            }
+            for (std::size_t r = 0; r < 2; ++r) {
+                CurrentDeviceGuard::set(device[r]);
+                if (arena[r] != nullptr) {
+                    CUDA_CHECK(cudaHostUnregister(arena[r]));
+                    std::free(arena[r]);
+                    arena[r] = nullptr;
+                }
+                arena[r] = static_cast<char*>(std::aligned_alloc(huge, wanted));
+                require(arena[r] != nullptr, "PipelinedExchange: bounce arena allocation failed");
+                (void)madvise(arena[r], wanted, MADV_HUGEPAGE);
+                std::memset(arena[r], 0, wanted);
+                CUDA_CHECK(cudaHostRegister(arena[r], wanted, cudaHostRegisterDefault));
+            }
+            arena_bytes = wanted;
+        }
+        const std::size_t offset = arena_used;
+        arena_used += bytes;
+        return offset;
     }
 };
 
@@ -287,8 +346,16 @@ ExchangeLanes& exchange_lanes(const ExecutionContext& ec) {
             const auto r = static_cast<std::size_t>(rank);
             CurrentDeviceGuard::set(ec.dev[r]->device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&lanes.stream[r], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&lanes.out[r], cudaStreamNonBlocking));
             CUDA_CHECK(cudaEventCreateWithFlags(&lanes.pulled[r], cudaEventDisableTiming));
             lanes.device[r] = ec.dev[r]->device;
+        }
+        if (const char* text = std::getenv("NINFER_TP_PREFILL_BOUNCE")) {
+            lanes.bounce = std::strtol(text, nullptr, 10) != 0;
+        }
+        if (const char* text = std::getenv("NINFER_TP_PREFILL_BOUNCE_BLOCK_KIB")) {
+            const long kib = std::strtol(text, nullptr, 10);
+            if (kib > 0) { lanes.block = static_cast<std::size_t>(kib) << 10; }
         }
     }
     require(lanes.device[0] == ec.dev[0]->device && lanes.device[1] == ec.dev[1]->device,
@@ -304,7 +371,19 @@ PipelinedExchange::PipelinedExchange(const ExecutionContext& ec, const PeerEvent
     require(events.live(), "PipelinedExchange: events must be live");
     require(events.pipeline_ == nullptr, "PipelinedExchange: a scope is already open");
     const CurrentDeviceGuard guard;
-    (void)exchange_lanes(ec);
+    ExchangeLanes& lanes = exchange_lanes(ec);
+    // The bounce arena is reused from offset 0. The previous scope's rank streams joined their own
+    // lanes, but a peer may still be reading this rank's arena, so the outbound lanes wait for it.
+    lanes.arena_used = 0;
+    if (lanes.bounce && lanes.previous_issued > 0) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec.dev[r]->device);
+            CUDA_CHECK(cudaStreamWaitEvent(
+                lanes.out[r], lanes.done_event(1 - rank, lanes.previous_issued - 1), 0));
+        }
+    }
+    lanes.previous_issued = 0;
     events.pipeline_ = this;
 }
 
@@ -312,6 +391,7 @@ PipelinedExchange::~PipelinedExchange() {
     events_->pipeline_ = nullptr;
     if (issued_ == 0) { return; }
     try {
+        exchange_lanes(*ec_).previous_issued = issued_;
         join();
     } catch (...) {
         // The rank streams are left unordered against the lanes only if CUDA itself failed, and
@@ -348,6 +428,45 @@ void PipelinedExchange::enqueue(const std::array<Tensor, 2>& buffer,
         const DeviceContext& local = *ec_->dev[rank];
         CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaEventRecord(events_->inputs_ready(rank), local.stream));
+    }
+    if (lanes.bounce) {
+        const std::size_t offset = lanes.reserve(bytes);
+        const std::size_t blocks = (bytes + lanes.block - 1) / lanes.block;
+        // Outbound: the rank's partial to its arena, one event per block.
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec_->dev[r]->device);
+            CUDA_CHECK(cudaStreamWaitEvent(lanes.out[r], events_->inputs_ready(rank), 0));
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const std::size_t at  = b * lanes.block;
+                const std::size_t len = std::min(lanes.block, bytes - at);
+                CUDA_CHECK(cudaMemcpyAsync(lanes.arena[r] + offset + at,
+                                           static_cast<const char*>(buffer[r].data) + at, len,
+                                           cudaMemcpyDeviceToHost, lanes.out[r]));
+                CUDA_CHECK(cudaEventRecord(lanes.sent_event(rank, b), lanes.out[r]));
+            }
+        }
+        // Inbound: the peer's blocks as they land, then the sum. The rank's own outbound copy must
+        // be over before the sum overwrites its source.
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            CurrentDeviceGuard::set(ec_->dev[r]->device);
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const std::size_t at  = b * lanes.block;
+                const std::size_t len = std::min(lanes.block, bytes - at);
+                CUDA_CHECK(cudaStreamWaitEvent(lanes.stream[r], lanes.sent_event(1 - rank, b), 0));
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<char*>(staging[r].data) + at,
+                                           lanes.arena[1 - r] + offset + at, len,
+                                           cudaMemcpyHostToDevice, lanes.stream[r]));
+            }
+            CUDA_CHECK(
+                cudaStreamWaitEvent(lanes.stream[r], lanes.sent_event(rank, blocks - 1), 0));
+            Tensor accumulator = buffer[r];
+            detail::residual_add_launch(staging[r], accumulator, lanes.stream[r]);
+            CUDA_CHECK(cudaEventRecord(lanes.done_event(rank, index), lanes.stream[r]));
+        }
+        ++issued_;
+        return;
     }
     for (int rank = 0; rank < 2; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
