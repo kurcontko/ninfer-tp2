@@ -320,9 +320,17 @@ std::int32_t prefill_exchange_slice_tokens() {
     return tokens;
 }
 
+// The slice for a chunk of `columns` tokens: the configured count, halved (down to 128) until the
+// chunk holds at least four slices, so short prompts and a prompt's last chunk pipeline as well.
+std::int32_t exchange_slice_for(std::int32_t columns) {
+    std::int32_t slice = prefill_exchange_slice_tokens();
+    while (slice > 128 && slice * 4 > columns) { slice /= 2; }
+    return slice;
+}
+
 template <class Body>
 void for_each_exchange_slice(std::int32_t columns, Body&& body) {
-    const std::int32_t slice = prefill_exchange_slice_tokens();
+    const std::int32_t slice = exchange_slice_for(columns);
     for (std::int32_t first = 0; first < columns; first += slice) {
         body(first, std::min(slice, columns - first));
     }
@@ -647,7 +655,7 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
     const bool prefill  = ph == Phase::Prefill;
     const auto& layers0 = parameters_.text.layers;
     const auto& layers1 = tp_->parameters->text.layers;
-    const std::int32_t slice = prefill ? prefill_exchange_slice_tokens() : 0;
+    const std::int32_t slice = prefill ? exchange_slice_for(x[0].ne[1]) : 0;
     const bool pipelined     = slice > 0 && x[0].ne[1] >= 2 * slice;
     for (std::size_t layer = 0; layer < layers0.size(); ++layer) {
         const RankBlocks block{&layers0[layer], &layers1[layer]};
